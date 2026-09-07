@@ -134,6 +134,11 @@ defmodule Magika do
   Returns `{:ok, result}` on success, or `{:error, result}` when the path does
   not exist or cannot be read. Directories and other special files are reported
   via dedicated content types (`directory`, `symlink`, `unknown`).
+
+  Files are sampled using bounded reads from the beginning and end. If the
+  beginning contains too few meaningful bytes for inference, the UTF-8 fallback
+  scans the file incrementally, preserving its classification without loading
+  the whole file into memory.
   """
   @spec identify_path(Path.t(), keyword()) :: {:ok, Result.t()} | {:error, Result.t()}
   @spec identify_path(t(), Path.t()) :: {:ok, Result.t()} | {:error, Result.t()}
@@ -226,9 +231,98 @@ defmodule Magika do
   end
 
   defp read_and_classify(magika, path) do
-    case File.read(path) do
-      {:ok, content} -> {:ok, predict_from_content(magika, content)}
-      {:error, _} -> {:error, :permission_error}
+    case File.open(path, [:read, :binary, :raw], &predict_from_file(magika, &1)) do
+      {:ok, {:ok, prediction}} -> {:ok, prediction}
+      _ -> {:error, :permission_error}
+    end
+  end
+
+  defp predict_from_file(magika, file) do
+    case :file.position(file, :eof) do
+      {:ok, size} when size > 0 ->
+        predict_from_seekable_file(magika, file, size)
+
+      # Some regular files, such as Linux procfs entries, report zero size or
+      # reject seeking to EOF. Read them sequentially with bounded buffers.
+      {:ok, 0} ->
+        predict_from_sequential_file(magika, file)
+
+      {:error, reason} when reason in [:einval, :espipe] ->
+        predict_from_sequential_file(magika, file)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp predict_from_seekable_file(%__MODULE__{config: config} = magika, file, size) do
+    with {:ok, prefix} <- read_file_block(file, 0, min(size, config.block_size)) do
+      cond do
+        size <= config.block_size ->
+          {:ok, predict_from_content(magika, prefix)}
+
+        insufficient_bytes?(prefix, config) ->
+          # The current in-memory fallback validates the entire content, not
+          # just the sampled ends. Keep that behavior with bounded buffers.
+          with {:ok, 0} <- :file.position(file, :bof) do
+            predict_from_sequential_file(magika, file)
+          end
+
+        true ->
+          with {:ok, suffix} <-
+                 read_file_block(file, size - config.block_size, config.block_size) do
+            # Feature extraction only examines the first and last block, so
+            # joining these windows preserves the features even when they overlap.
+            {:ok, dl_prediction(magika, prefix <> suffix)}
+          end
+      end
+    end
+  end
+
+  defp read_file_block(file, offset, size), do: :file.pread(file, offset, size)
+
+  defp predict_from_sequential_file(%__MODULE__{config: config} = magika, file) do
+    with {:ok, size, prefix, suffix, valid?} <-
+           read_file_sample(file, config.block_size, {0, <<>>, <<>>, <<>>}) do
+      cond do
+        size <= config.block_size ->
+          {:ok, predict_from_content(magika, prefix)}
+
+        insufficient_bytes?(prefix, config) ->
+          {:ok, special_prediction(magika, if(valid?, do: "txt", else: "unknown"))}
+
+        true ->
+          {:ok, dl_prediction(magika, prefix <> suffix)}
+      end
+    end
+  end
+
+  defp read_file_sample(file, block_size, {size, prefix, suffix, pending}) do
+    case :file.read(file, block_size) do
+      :eof ->
+        {:ok, size, prefix, suffix, pending == <<>>}
+
+      {:ok, chunk} ->
+        prefix = binary_slice(prefix <> chunk, 0, block_size)
+        tail = suffix <> chunk
+        keep = min(byte_size(tail), block_size)
+        suffix = binary_part(tail, byte_size(tail) - keep, keep)
+        pending = utf8_pending(pending, chunk)
+        read_file_sample(file, block_size, {size + byte_size(chunk), prefix, suffix, pending})
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp utf8_pending(false, _chunk), do: false
+
+  defp utf8_pending(pending, chunk) do
+    case :unicode.characters_to_binary(pending <> chunk, :utf8, :utf8) do
+      valid when is_binary(valid) -> <<>>
+      # A UTF-8 character can straddle reads; retain at most three bytes.
+      {:incomplete, _valid, rest} -> rest
+      {:error, _valid, _rest} -> false
     end
   end
 
@@ -245,17 +339,20 @@ defmodule Magika do
         few_bytes_prediction(magika, content)
 
       true ->
-        beg = Features.extract_beg(content, config)
-
         # If the n-th token (n = min_file_size_for_dl) is padding, then after
         # stripping whitespace we do not have enough meaningful bytes for a
         # reliable DL prediction; fall back to the few-bytes heuristic.
-        if Enum.at(beg, config.min_file_size_for_dl - 1) == config.padding_token do
+        if insufficient_bytes?(content, config) do
           few_bytes_prediction(magika, content)
         else
           dl_prediction(magika, content)
         end
     end
+  end
+
+  defp insufficient_bytes?(content, config) do
+    beg = Features.extract_beg(content, config)
+    Enum.at(beg, config.min_file_size_for_dl - 1) == config.padding_token
   end
 
   defp dl_prediction(%__MODULE__{config: config} = magika, content) do
