@@ -1,7 +1,7 @@
 defmodule Magika.MixProject do
   use Mix.Project
 
-  @version "0.1.0-rc.0"
+  @version "0.1.0"
   @source_url "https://github.com/fishtreesugar/magika-elixir"
   @upstream_url "https://github.com/google/magika"
 
