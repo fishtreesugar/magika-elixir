@@ -52,7 +52,7 @@ defmodule Magika.MixProject do
   defp deps do
     [
       # Elixir bindings for Microsoft ONNX Runtime.
-      {:onnxruntime, "~> 0.1.0-rc.1"},
+      {:onnxruntime, "~> 0.1.0"},
       {:nx, "~> 0.9 or ~> 1.0"},
       {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.37", only: :dev, runtime: false}
